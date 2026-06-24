@@ -125,10 +125,24 @@ class Rivian:
         self._app_session_token = csrf_data["appSessionToken"]
         return response
 
-    def raw_graphql_query(self, url, query, headers):
-        response = requests.post(url, json=query, headers=headers)
-        if response.status_code != 200:
+    def raw_graphql_query(self, url, query, headers, retries=2, backoff=1):
+        # Retry only transient server errors (502/503/504) with linear backoff.
+        # Rivian returns rate-limit/lockout as HTTP 200 with a GraphQL
+        # RATE_LIMIT error (not a 5xx), so this retry path never re-hits a
+        # rate-limited endpoint and cannot worsen an account lockout.
+        response = None
+        for attempt in range(retries + 1):
+            response = requests.post(url, json=query, headers=headers)
+            if response.status_code == 200:
+                return response
+            if response.status_code in (502, 503, 504) and attempt < retries:
+                wait = backoff * (attempt + 1)
+                log.warning(f"Graphql {response.status_code} {response.reason}; "
+                            f"retry {attempt + 1}/{retries} in {wait}s")
+                time.sleep(wait)
+                continue
             log.warning(f"Graphql error: Response status: {response.status_code} Reason: {response.reason}")
+            return response
         return response
 
     def gateway_headers(self):
@@ -235,7 +249,7 @@ class Rivian:
         headers = self.transaction_headers()
         query = {
             "operationName": "getOrder",
-            "query": "query getOrder($orderId: String!) { order(id: $orderId) { id storeId userId orderDate orderCancelDate type state currency locale subtotal discountTotal taxTotal total shippingAddress { firstName lastName line1 line2 city state country postalCode __typename } payments { method currency status type card { last4 expiryDate brand __typename } __typename } items { id title type sku unitPrice quantity state productDetails { ... on ChildProduct { dimensionValues { name valueName localizedStrings __typename } __typename } __typename } __typename } fulfillmentSummaryStatus fulfillmentInfo { fulfillments { fulfillmentId fulfillmentStatus fulfillmentMethod fulfillmentVendor tracking { status carrier number url shipDate deliveredDate serviceType __typename } estimatedDeliveryWindow { startDate endDate __typename } items { orderItemId quantityFulfilled isPartialFulfillment __typename } __typename } pendingFulfillmentItems { orderItemId quantity __typename } __typename } __typename }}",
+            "query": "query getOrder($orderId: String!) { order(id: $orderId) { id storeId userId orderDate orderCancelDate type state currency locale subtotal discountTotal taxTotal total shippingAddress { firstName lastName line1 line2 city state country postalCode __typename } payments { date intent amount method currency status type card { last4 expiryDate brand __typename } __typename } items { id title type sku unitPrice quantity state productDetails { ... on ChildProduct { dimensionValues { name valueName localizedStrings __typename } __typename } __typename } __typename } fulfillmentSummaryStatus fulfillmentInfo { fulfillments { fulfillmentId fulfillmentStatus fulfillmentMethod fulfillmentVendor tracking { status carrier number url shipDate deliveredDate serviceType __typename } estimatedDeliveryWindow { startDate endDate __typename } items { orderItemId quantityFulfilled isPartialFulfillment __typename } __typename } pendingFulfillmentItems { orderItemId quantity __typename } __typename } __typename }}",
             "variables": {
                 "orderId": order_id
             },

@@ -263,6 +263,12 @@ def get_order(order_id, verbose):
         return result
     result['orderDate'] = order.get('orderDate')
     result['fulfillmentSummaryStatus'] = order.get('fulfillmentSummaryStatus')
+    # Most recent successful payment date — reflects recent order activity
+    # (e.g. configuring/finalizing a long-standing reservation), unlike
+    # orderDate which is the original order/reservation creation date.
+    payment_dates = [p['date'] for p in (order.get('payments') or [])
+                     if p.get('date')]
+    result['lastPaymentDate'] = max(payment_dates) if payment_dates else None
     fulfillments = []
     for f in ((order.get('fulfillmentInfo') or {}).get('fulfillments') or []):
         fulfillments.append({
@@ -283,6 +289,9 @@ def print_order_fulfillment(order_id, verbose, privacy):
     tracking; this stays silent in that case.
     """
     order_info = get_order(order_id, verbose)
+    last_payment = order_info.get('lastPaymentDate')
+    if last_payment:
+        print(f"Last payment: {last_payment[:10]}")
     for f in order_info.get('fulfillments') or []:
         edw = f.get('estimatedDeliveryWindow') or {}
         if edw.get('startDate') or edw.get('endDate'):
