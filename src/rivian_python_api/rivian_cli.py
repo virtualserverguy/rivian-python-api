@@ -2,6 +2,7 @@
 # encoding: utf-8
 import sys
 import argparse
+import json
 from rivian_api import *
 from rivian_map import *
 import pickle
@@ -53,6 +54,41 @@ def get_rivian_object():
     return rivian
 
 
+# Set from --raw in main(); makes dump_response() emit pretty JSON.
+RAW = False
+
+
+def gql_data(response_json, *path, default=None):
+    """Safely walk a GraphQL response: response_json['data'][*path].
+
+    Returns ``default`` if the response is not a dict, errored (no 'data'), or
+    any key along the path is missing or None. This is the single guard against
+    KeyError/TypeError when Rivian returns an error body, deprecates an
+    endpoint, or stops sending a field. Adding/consuming new fields safely is
+    just another gql_data() call.
+    """
+    if not isinstance(response_json, dict):
+        return default
+    node = response_json.get('data')
+    for key in path:
+        if not isinstance(node, dict):
+            return default
+        node = node.get(key)
+    return default if node is None else node
+
+
+def dump_response(label, response_json):
+    """Print a raw API response: pretty JSON under --raw, else legacy repr.
+
+    Used for field discovery — run any command with --raw (or --verbose) to see
+    exactly what Rivian returned, including newly added fields.
+    """
+    if RAW:
+        print(json.dumps(response_json, indent=2, default=str))
+    else:
+        print(f"{label}:\n{response_json}")
+
+
 def login_with_password(verbose):
     rivian = Rivian()
     try:
@@ -94,10 +130,15 @@ def login(verbose):
 
 def user_information(verbose):
     rivian = get_rivian_object()
-    response_json = rivian.get_user_information()
+    try:
+        response_json = rivian.get_user_information()
+    except Exception:
+        if verbose:
+            print("Error getting user information")
+        return {}
     if verbose:
-        print(f"user_information:\n{response_json}")
-    return response_json['data']['currentUser']
+        dump_response("user_information", response_json)
+    return gql_data(response_json, 'currentUser', default={}) or {}
 
 
 def vehicle_orders(verbose):
@@ -107,9 +148,9 @@ def vehicle_orders(verbose):
     except:
         return []
     if verbose:
-        print(f"orders:\n{response_json}")
+        dump_response("orders", response_json)
     orders = []
-    for order in response_json['data']['orders']['data']:
+    for order in gql_data(response_json, 'orders', 'data', default=[]) or []:
         orders.append({
             'id': order['id'],
             'orderDate': order['orderDate'],
@@ -122,41 +163,79 @@ def vehicle_orders(verbose):
     return orders
 
 
+def model_from_items(items):
+    """Best-effort vehicle model (e.g. 'R1S', 'R2') from an order's items.
+
+    Read from the vehicle item's configuration ruleset, used as a fallback when
+    Rivian leaves the nested `order.vehicle` object null.
+    """
+    for i in items or []:
+        config = i.get('configuration') or {}
+        meta = (config.get('ruleset') or {}).get('meta') or {}
+        if meta.get('vehicle'):
+            return meta['vehicle']
+    return None
+
+
 def order_details(order_id, verbose):
     rivian = get_rivian_object()
-    response_json = rivian.order(order_id=order_id)
+    try:
+        response_json = rivian.order(order_id=order_id)
+    except Exception:
+        if verbose:
+            print(f"Error getting order details for {order_id}")
+        return {}
     if verbose:
-        print(f"order_details:\n{response_json}")
+        dump_response("order_details", response_json)
     data = {}
-    if 'data' in response_json and 'order' in response_json['data']:
-        if 'vehicle' in response_json['data']['order']:
-            try:
-                data = {
-                    'vehicleId': response_json['data']['order']['vehicle']['vehicleId'],
-                    'vin': response_json['data']['order']['vehicle']['vin'],
-                    'modelYear': response_json['data']['order']['vehicle']['modelYear'],
-                    'make': response_json['data']['order']['vehicle']['make'],
-                    'model': response_json['data']['order']['vehicle']['model'],
-                }
-            except:
-                log.warning(f"Order details missing key items, "
-                            f"found: {response_json['data']['order']['vehicle']}")
-                pass
-    if 'items' in response_json['data']['order']:
-        for i in response_json['data']['order']['items']:
-            if i['configuration'] is not None:
-                for c in i['configuration']['options']:
-                    data[c['groupName']] = c['optionName']
+    order = (response_json.get('data') or {}).get('order') \
+        if isinstance(response_json, dict) else None
+    if not order:
+        return data
+    if order.get('vehicle'):
+        try:
+            data = {
+                'vehicleId': order['vehicle']['vehicleId'],
+                'vin': order['vehicle']['vin'],
+                'modelYear': order['vehicle']['modelYear'],
+                'make': order['vehicle']['make'],
+                'model': order['vehicle']['model'],
+            }
+        except Exception:
+            log.warning(f"Order details missing key items, "
+                        f"found: {order['vehicle']}")
+    else:
+        # Rivian does not always populate the nested `vehicle` object (e.g. for
+        # some delivered orders, or vehicles not yet built). Recover what is
+        # actually present elsewhere in the same response rather than dropping
+        # it. vehicleId is only in the nested object, so it stays absent here
+        # (handled downstream via user_information()).
+        if order.get('vin'):
+            data['vin'] = order['vin']
+        model = model_from_items(order.get('items'))
+        if model:
+            data['model'] = model
+    for i in order.get('items') or []:
+        if i.get('configuration') is not None:
+            for c in i['configuration']['options']:
+                data[c['groupName']] = c['optionName']
     return data
 
 
 def retail_orders(verbose):
     rivian = get_rivian_object()
-    response_json = rivian.retail_orders()
+    try:
+        response_json = rivian.retail_orders()
+    except Exception:
+        if verbose:
+            print("Error getting retail orders")
+        return []
     if verbose:
-        print(f"retail_orders:\n{response_json}")
+        dump_response("retail_orders", response_json)
     orders = []
-    for order in response_json['data']['searchOrders']['data']:
+    data = response_json.get('data') if isinstance(response_json, dict) else None
+    search_orders = (data or {}).get('searchOrders') or {}
+    for order in search_orders.get('data') or []:
         orders.append({
             'id': order['id'],
             'orderDate': order['orderDate'],
@@ -169,21 +248,75 @@ def retail_orders(verbose):
 
 def get_order(order_id, verbose):
     rivian = get_rivian_object()
-    response_json = rivian.get_order(order_id=order_id)
+    try:
+        response_json = rivian.get_order(order_id=order_id)
+    except Exception:
+        if verbose:
+            print(f"Error getting order info for {order_id}")
+        return {}
     if verbose:
-        print(f"get_order:\n{response_json}")
-    order = {}
-    order['orderDate'] = response_json['data']['order']['orderDate']
-    return order
+        dump_response("get_order", response_json)
+    result = {}
+    order = (response_json.get('data') or {}).get('order') \
+        if isinstance(response_json, dict) else None
+    if not order:
+        return result
+    result['orderDate'] = order.get('orderDate')
+    result['fulfillmentSummaryStatus'] = order.get('fulfillmentSummaryStatus')
+    fulfillments = []
+    for f in ((order.get('fulfillmentInfo') or {}).get('fulfillments') or []):
+        fulfillments.append({
+            'status': f.get('fulfillmentStatus'),
+            'method': f.get('fulfillmentMethod'),
+            'tracking': f.get('tracking'),
+            'estimatedDeliveryWindow': f.get('estimatedDeliveryWindow'),
+        })
+    result['fulfillments'] = fulfillments
+    return result
+
+
+def print_order_fulfillment(order_id, verbose, privacy):
+    """Print carrier tracking and estimated delivery window for an order's
+    fulfillments, when present (e.g. shipped accessories / retail items).
+
+    Vehicles are delivered by appointment, so their fulfillments carry no
+    tracking; this stays silent in that case.
+    """
+    order_info = get_order(order_id, verbose)
+    for f in order_info.get('fulfillments') or []:
+        edw = f.get('estimatedDeliveryWindow') or {}
+        if edw.get('startDate') or edw.get('endDate'):
+            print(f"Estimated delivery window: "
+                  f"{edw.get('startDate')} - {edw.get('endDate')}")
+        tracking = f.get('tracking') or {}
+        if tracking.get('number'):
+            number = tracking['number']
+            if privacy:
+                number = 'xxxx' + number[-4:]
+            print(f"Tracking ({f.get('status') or tracking.get('status')}):")
+            if tracking.get('carrier'):
+                print(f"   Carrier: {tracking['carrier']}")
+            print(f"   Number: {number}")
+            if tracking.get('shipDate'):
+                print(f"   Shipped: {tracking['shipDate']}")
+            if tracking.get('deliveredDate'):
+                print(f"   Delivered: {tracking['deliveredDate']}")
+            if tracking.get('url') and not privacy:
+                print(f"   URL: {tracking['url']}")
 
 
 def payment_methods(verbose):
     rivian = get_rivian_object()
-    response_json = rivian.payment_methods()
+    try:
+        response_json = rivian.payment_methods()
+    except Exception:
+        if verbose:
+            print("Error getting payment methods")
+        return []
     if verbose:
-        print(f"payment_methods:\n{response_json}")
+        dump_response("payment_methods", response_json)
     pmt = []
-    for p in response_json['data']['paymentMethods']:
+    for p in gql_data(response_json, 'paymentMethods', default=[]) or []:
         pmt.append({
             'type': p['type'],
             'default': p['default'],
@@ -194,41 +327,46 @@ def payment_methods(verbose):
 
 def check_by_rivian_id(verbose):
     rivian = get_rivian_object()
-    response_json = rivian.check_by_rivian_id()
+    try:
+        response_json = rivian.check_by_rivian_id()
+    except Exception:
+        if verbose:
+            print("Error getting check_by_rivian_id")
+        return {}
     if verbose:
-        print(f"check_by_rivian_id:\n{response_json}")
-    data = {'Chargepoint checkByRivianId': response_json['data']['chargepoint']['checkByRivianId']}
-    return data
+        dump_response("check_by_rivian_id", response_json)
+    return {'Chargepoint checkByRivianId':
+            gql_data(response_json, 'chargepoint', 'checkByRivianId')}
 
 
 def get_linked_email_for_rivian_id(verbose):
     rivian = get_rivian_object()
-    response_json = rivian.get_linked_email_for_rivian_id()
+    try:
+        response_json = rivian.get_linked_email_for_rivian_id()
+    except Exception:
+        if verbose:
+            print("Error getting linked email for rivian id")
+        return {}
     if verbose:
-        print(f"get_linked_email_for_rivian_id:\n{response_json}")
-    data = {
+        dump_response("get_linked_email_for_rivian_id", response_json)
+    return {
         'Chargepoint linked email':
-            response_json['data']['chargepoint']['getLinkedEmailForRivianId']['email']
+            gql_data(response_json, 'chargepoint', 'getLinkedEmailForRivianId', 'email')
     }
-    return data
-
-
-def get_parameter_store_values(verbose):
-    rivian = get_rivian_object()
-    response_json = rivian.get_parameter_store_values()
-    if verbose:
-        print(f"get_parameter_store_values:\n{response_json}")
 
 
 def get_vehicle(vehicle_id, verbose):
     rivian = get_rivian_object()
-    response_json = rivian.get_vehicle(vehicle_id=vehicle_id)
+    try:
+        response_json = rivian.get_vehicle(vehicle_id=vehicle_id)
+    except Exception:
+        if verbose:
+            print(f"Error getting vehicle for {vehicle_id}")
+        return []
     if verbose:
-        print(f"get_vehicle:\n{response_json}")
+        dump_response("get_vehicle", response_json)
     data = []
-    if 'data' not in response_json:
-        return data
-    for u in response_json['data']['getVehicle']['invitedUsers']:
+    for u in gql_data(response_json, 'getVehicle', 'invitedUsers', default=[]) or []:
         if u['__typename'] != 'ProvisionedUser':
             continue
         ud = {
@@ -257,7 +395,7 @@ def get_vehicle_state(vehicle_id, verbose, minimal=False):
         print(f"Error: {str(e)}")
         return None
     if verbose:
-        print(f"get_vehicle_state:\n{response_json}")
+        dump_response("get_vehicle_state", response_json)
     if 'data' in response_json and 'vehicleState' in response_json['data']:
         return response_json['data']['vehicleState']
     else:
@@ -272,9 +410,9 @@ def get_vehicle_last_seen(vehicle_id, verbose):
         print(f"{str(e)}")
         return None
     if verbose:
-        print(f"get_vehicle_last_seen:\n{response_json}")
-    last_seen = parse(response_json['data']['vehicleState']['cloudConnection']['lastSync'])
-    return last_seen
+        dump_response("get_vehicle_last_seen", response_json)
+    last_sync = gql_data(response_json, 'vehicleState', 'cloudConnection', 'lastSync')
+    return parse(last_sync) if last_sync else None
 
 
 def plan_trip(vehicle_id, starting_soc, starting_range_meters, origin_lat, origin_long, dest_lat, dest_long, verbose):
@@ -293,7 +431,7 @@ def plan_trip(vehicle_id, starting_soc, starting_range_meters, origin_lat, origi
         print(f"{str(e)}")
         return None
     if verbose:
-        print(f"plan_trip:\n{response_json}")
+        dump_response("plan_trip", response_json)
     return response_json
 
 
@@ -305,8 +443,8 @@ def get_ota_info(vehicle_id, verbose):
         print(f"{str(e)}")
         return None
     if verbose:
-        print(f"get_ota_info:\n{response_json}")
-    return response_json['data']['getVehicle']
+        dump_response("get_ota_info", response_json)
+    return gql_data(response_json, 'getVehicle', default={}) or {}
 
 
 def transaction_status(order_id, verbose):
@@ -318,7 +456,7 @@ def transaction_status(order_id, verbose):
             print(f"Error getting transaction status for {order_id}")
         return None
     if verbose:
-        print(f"transaction_status:\n{response_json}")
+        dump_response("transaction_status", response_json)
     status = {}
     if response_json and \
             'data' in response_json and \
@@ -343,81 +481,99 @@ def transaction_status(order_id, verbose):
     return status
 
 
-def finance_summary(order_id, verbose):
-    rivian = get_rivian_object()
-    response_json = rivian.finance_summary(order_id=order_id)
-    if verbose:
-        print(f"finance_summary:\n{response_json}")
-
-
 def chargers(verbose):
     rivian = get_rivian_object()
-    response_json = rivian.get_registered_wallboxes()
+    try:
+        response_json = rivian.get_registered_wallboxes()
+    except Exception:
+        if verbose:
+            print("Error getting chargers")
+        return []
     if verbose:
-        print(f"chargers:\n{response_json}")
-    return response_json['data']['getRegisteredWallboxes']
+        dump_response("chargers", response_json)
+    return gql_data(response_json, 'getRegisteredWallboxes', default=[]) or []
 
 
 def delivery(order_id, verbose):
     rivian = get_rivian_object()
-    response_json = rivian.delivery(order_id=order_id)
+    try:
+        response_json = rivian.delivery(order_id=order_id)
+    except Exception:
+        if verbose:
+            print(f"Error getting delivery info for {order_id}")
+        return {}
     if verbose:
-        print(f"delivery:\n{response_json}")
+        dump_response("delivery", response_json)
     vehicle = {}
-    if 'delivery' in response_json['data'] and response_json['data']['delivery']:
-        vehicle['vin'] = response_json['data']['delivery']['vehicleVIN']
-        vehicle['carrier'] = response_json['data']['delivery']['carrier']
-        vehicle['status'] = response_json['data']['delivery']['status']
-        vehicle['appointmentDetails'] = response_json['data']['delivery']['appointmentDetails']
+    data = response_json.get('data') if isinstance(response_json, dict) else None
+    delivery_info = data.get('delivery') if data else None
+    if delivery_info:
+        vehicle['vin'] = delivery_info['vehicleVIN']
+        vehicle['carrier'] = delivery_info['carrier']
+        vehicle['status'] = delivery_info['status']
+        vehicle['appointmentDetails'] = delivery_info['appointmentDetails']
     return vehicle
 
 
 def speakers(verbose):
     rivian = get_rivian_object()
-    response_json = rivian.get_provisioned_camp_speakers()
+    try:
+        response_json = rivian.get_provisioned_camp_speakers()
+    except Exception:
+        if verbose:
+            print("Error getting speakers")
+        return []
     if verbose:
-        print(f"speakers:\n{response_json}")
-    return response_json['data']['currentUser']['vehicles']
+        dump_response("speakers", response_json)
+    return gql_data(response_json, 'currentUser', 'vehicles', default=[]) or []
 
 
 def images(verbose):
     rivian = get_rivian_object()
-    response_json = rivian.get_vehicle_images()
+    try:
+        response_json = rivian.get_vehicle_images()
+    except Exception:
+        if verbose:
+            print("Error getting images")
+        return []
     if verbose:
-        print(f"images:\n{response_json}")
+        dump_response("images", response_json)
     images = []
-    for i in response_json['data']['getVehicleOrderMobileImages']:
+    for i in gql_data(response_json, 'getVehicleOrderMobileImages', default=[]) or []:
         images.append({
             'size': i['size'],
             'design': i['design'],
             'placement': i['placement'],
             'url': i['url']
         })
-    print(images)
     return images
 
 
 def get_user(verbose):
     rivian = get_rivian_object()
-    response_json = rivian.user()
-    if verbose:
-        print(f"get_user:\n{response_json}")
     try:
-        phone = response_json['data']['user']['phone']['formatted']
-    except Exception as e:
-        phone = None
+        response_json = rivian.user()
+    except Exception:
+        if verbose:
+            print("Error getting user details")
+        return {}
+    if verbose:
+        dump_response("get_user", response_json)
+    u = gql_data(response_json, 'user', default={}) or {}
+    if not u:
+        return {}
     user = {
-        'userId': response_json['data']['user']['userId'],
-        'email': response_json['data']['user']['email']['email'],
-        'phone': phone,
-        'firstName': response_json['data']['user']['firstName'],
-        'lastName': response_json['data']['user']['lastName'],
-        'newsletterSubscription': response_json['data']['user']['newsletterSubscription'],
-        'smsSubscription': response_json['data']['user']['smsSubscription'],
-        'registrationChannels2FA': response_json['data']['user']['registrationChannels2FA'],
+        'userId': u.get('userId'),
+        'email': (u.get('email') or {}).get('email'),
+        'phone': (u.get('phone') or {}).get('formatted'),
+        'firstName': u.get('firstName'),
+        'lastName': u.get('lastName'),
+        'newsletterSubscription': u.get('newsletterSubscription'),
+        'smsSubscription': u.get('smsSubscription'),
+        'registrationChannels2FA': u.get('registrationChannels2FA') or {},
         'addresses': [],
     }
-    for a in response_json['data']['user']['addresses']:
+    for a in u.get('addresses') or []:
         user['addresses'].append({
             'type': a['type'],
             'line1': a['line1'],
@@ -432,20 +588,29 @@ def get_user(verbose):
 
 def charging_schedule(vehicle_id, verbose):
     rivian = get_rivian_object()
-    response_json = rivian.get_charging_schedule(vehicle_id)
+    try:
+        response_json = rivian.get_charging_schedule(vehicle_id)
+    except Exception:
+        if verbose:
+            print("Error getting charging schedule")
+        return []
     if verbose:
-        print(f"get_charging_schedule:\n{response_json}")
-    schedule = response_json['data']['getVehicle']['chargingSchedules']
-    return schedule
+        dump_response("get_charging_schedule", response_json)
+    return gql_data(response_json, 'getVehicle', 'chargingSchedules', default=[]) or []
 
 
 def charging_sessions(verbose):
     rivian = get_rivian_object()
-    response_json = rivian.get_completed_session_summaries()
+    try:
+        response_json = rivian.get_completed_session_summaries()
+    except Exception:
+        if verbose:
+            print("Error getting charging sessions")
+        return []
     if verbose:
-        print(f"get_completed_session_summaries:\n{response_json}")
+        dump_response("get_completed_session_summaries", response_json)
     sessions = []
-    for s in response_json['data']['getCompletedSessionSummaries']:
+    for s in gql_data(response_json, 'getCompletedSessionSummaries', default=[]) or []:
         sessions.append({
             'charge_start': s['startInstant'],
             'charge_end': s['endInstant'],
@@ -461,28 +626,41 @@ def charging_sessions(verbose):
 
 def charging_session(verbose):
     rivian = get_rivian_object()
-    response_json = rivian.get_non_rivian_user_session()
+    try:
+        response_json = rivian.get_non_rivian_user_session()
+    except Exception:
+        if verbose:
+            print("Error getting charging session")
+        return None
     if verbose:
-        print(f"get_non_rivian_user_session:\n{response_json}")
-    session = response_json['data']['getNonRivianUserSession']
-    return session
+        dump_response("get_non_rivian_user_session", response_json)
+    return gql_data(response_json, 'getNonRivianUserSession')
 
 
 def live_charging_session(vehicle_id, verbose=False):
     rivian = get_rivian_object()
-    response_json = rivian.get_live_session_data(vehicle_id)
+    try:
+        response_json = rivian.get_live_session_data(vehicle_id)
+    except Exception:
+        if verbose:
+            print("Error getting live charging session")
+        return None
     if verbose:
-        print(f"get_live_session_data:\n{response_json}")
-    session = response_json['data']['getLiveSessionData']
-    return session
+        dump_response("get_live_session_data", response_json)
+    return gql_data(response_json, 'getLiveSessionData')
 
 
 def live_charging_history(vehicle_id, verbose=False):
     rivian = get_rivian_object()
-    response_json = rivian.get_live_session_history(vehicle_id)
+    try:
+        response_json = rivian.get_live_session_history(vehicle_id)
+    except Exception:
+        if verbose:
+            print("Error getting live charging history")
+        return []
     if verbose:
-        print(f"get_live_session_history:\n{response_json}")
-    history = response_json['data']['getLiveSessionHistory']['chartData']
+        dump_response("get_live_session_history", response_json)
+    history = gql_data(response_json, 'getLiveSessionHistory', 'chartData', default=[]) or []
     # sort history by 'time'
     history.sort(key=lambda x: x['time'])
     return history
@@ -491,7 +669,7 @@ def live_charging_history(vehicle_id, verbose=False):
 def vehicle_command(command, vehicle_id=None, verbose=False):
     vehiclePublicKey = None
     user_info = user_information(verbose)
-    for v in user_info['vehicles']:
+    for v in user_info.get('vehicles', []):
         if vehicle_id and v['id'] == vehicle_id:
             found = True
         else:
@@ -501,8 +679,12 @@ def vehicle_command(command, vehicle_id=None, verbose=False):
             vehiclePublicKey = v['vas']['vehiclePublicKey']
             break
         # Only need first
-    vasPhoneId = user_info['enrolledPhones'][0]['vas']['vasPhoneId']
-    deviceName = user_info['enrolledPhones'][0]['enrolled'][0]['deviceName']
+    enrolled_phones = user_info.get('enrolledPhones') or []
+    if not enrolled_phones:
+        print("No enrolled phones found for this account")
+        return
+    vasPhoneId = enrolled_phones[0]['vas']['vasPhoneId']
+    deviceName = enrolled_phones[0]['enrolled'][0]['deviceName']
 
     vehicle = get_vehicle(vehicle_id=vehicle_id, verbose=verbose)
     deviceId = None
@@ -529,7 +711,7 @@ def test_graphql(verbose):
     response = rivian.raw_graphql_query(url=RIVIAN_CONTENT_PATH, query=query, headers=rivian.gateway_headers())
     response_json = response.json()
     if verbose:
-        print(f"test_graphql:\n{response_json}")
+        dump_response("test_graphql", response_json)
 
 
 def get_local_time(ts):
@@ -602,6 +784,7 @@ def main():
     parser.add_argument('--test', help='For testing graphql queries', required=False, action='store_true')
     parser.add_argument('--charge_ids', help='Show charge_ids', required=False, action='store_true')
     parser.add_argument('--verbose', help='Verbose output', required=False, action='store_true')
+    parser.add_argument('--raw', help='Dump raw JSON API responses (for field discovery)', required=False, action='store_true')
     parser.add_argument('--privacy', help='Fuzz order/vin info', required=False, action='store_true')
     parser.add_argument('--state', help='Get vehicle state', required=False, action='store_true')
     parser.add_argument('--vehicle', help='Get vehicle access info', required=False, action='store_true')
@@ -649,6 +832,13 @@ def main():
                         )
     args = parser.parse_args()
     original_stdout = sys.stdout
+
+    # --raw implies the raw-dump path: turn on the per-command response dumps
+    # and switch their format to pretty JSON.
+    if args.raw:
+        global RAW
+        RAW = True
+        args.verbose = True
 
     if args.all:
         print("Running all commands silently")
@@ -709,9 +899,6 @@ def main():
                 print(f"Item: {order['items'][0]}")
                 print(f"Customer flow complete: {'Yes' if order['isConsumerFlowComplete'] else 'No'}")
 
-                # No extra useful info to display
-                # order_info = get_order(order['id'], args.verbose)
-
                 # Get delivery info
                 delivery_status = delivery(order['id'], args.verbose)
                 if 'carrier' in delivery_status:
@@ -726,6 +913,9 @@ def main():
                     print(f'   End  : {end.strftime("%m/%d/%Y, %H:%M %p")}')
                 else:
                     print("Delivery appointment details: Not available yet")
+
+                # Get fulfillment tracking / estimated delivery window
+                print_order_fulfillment(order['id'], args.verbose, args.privacy)
 
                 # Get transaction steps
                 if order['id']:
@@ -746,8 +936,6 @@ def main():
                             print(f"   Step: {s}: {transaction_steps[s]['item']}: {transaction_steps[s]['status']}, Complete: {transaction_steps[s]['complete']}")
                             i += 1
 
-                # Don't need to show this for now
-                # finance_summary(order['id'], args.verbose)
                 print("\n")
         else:
             print("No Vehicle Orders found")
@@ -763,6 +951,7 @@ def main():
                 print(f"Order State: {order['state']}")
                 print(f"Status: {order['fulfillmentSummaryStatus']}")
                 print(f"Items: {', '.join(order['items'])}")
+                print_order_fulfillment(order['id'], args.verbose, args.privacy)
                 print("\n")
         else:
             print("No Retail Orders found")
@@ -786,7 +975,7 @@ def main():
                     found_vehicle = True
         if not found_vehicle:
             user_info = user_information(verbose)
-            for v in user_info['vehicles']:
+            for v in user_info.get('vehicles', []):
                 if 'id' in v:
                     vehicle_id = v['id']
                     found_vehicle = True
@@ -828,9 +1017,6 @@ def main():
         for i in data:
             print(f"{i}: {data[i]}")
         print("\n")
-
-    # No value?
-    # get_parameter_store_values(args.verbose)
 
     # For testing new graphql queries
     if args.test:
@@ -885,7 +1071,7 @@ def main():
     if args.user_info or args.all:
         print("User Vehicles:")
         user_info = user_information(args.verbose)
-        for v in user_info['vehicles']:
+        for v in user_info.get('vehicles', []):
             print(f"Vehicle ID: {v['id']}")
             if args.privacy:
                 vin = v['vin'][-8:-3] + 'xxx'
@@ -901,7 +1087,7 @@ def main():
                 print("   Features:")
                 for f in v['vehicle']['vehicleState']['supportedFeatures']:
                     print(f"      {f['name']}: {f['status']}")
-        for p in user_info['enrolledPhones']:
+        for p in user_info.get('enrolledPhones', []):
             print("Enrolled phones:")
             for d in p['enrolled']:
                 if d['vehicleId'] == vehicle_id:
@@ -964,6 +1150,16 @@ def main():
             print(f"   Charging Time Estimation Validity: {state['chargingTimeEstimationValidity']['value']}")
             print(f"   Limited Accel Cold: {state['limitedAccelCold']['value']}")
             print(f"   Limited Regen Cold: {state['limitedRegenCold']['value']}")
+            if state.get('rangeThreshold'):
+                print(f"   Range Threshold: {state['rangeThreshold']['value']}")
+            if state.get('chargerDerateStatus'):
+                print(f"   Charger Derate: {state['chargerDerateStatus']['value']}")
+            if state.get('remoteChargingAvailable'):
+                print(f"   Remote Charging Available: {bool(state['remoteChargingAvailable']['value'])}")
+            if state.get('batteryHvThermalEvent'):
+                print(f"   HV Thermal Event: {state['batteryHvThermalEvent']['value']}")
+            if state.get('batteryHvThermalEventPropagation'):
+                print(f"   HV Thermal Propagation: {state['batteryHvThermalEventPropagation']['value']}")
 
 
             print("OTA:")
@@ -1028,6 +1224,10 @@ def main():
             print(f"   Front right Heat: {state['seatFrontRightHeat']['value'] == 'On'}")
             print(f"   Rear left Heat: {state['seatRearLeftHeat']['value'] == 'On'}")
             print(f"   Rear right Heat: {state['seatRearRightHeat']['value'] == 'On'}")
+            if state.get('seatFrontLeftVent'):
+                print(f"   Front left Vent: {state['seatFrontLeftVent']['value'] == 'On'}")
+            if state.get('seatFrontRightVent'):
+                print(f"   Front right Vent: {state['seatFrontRightVent']['value'] == 'On'}")
 
             print("Storage:")
             print("   Frunk:")
@@ -1053,6 +1253,8 @@ def main():
             print(f"   Service Mode: {state['serviceMode']['value']}")
             print(f"   Car Wash Mode: {state['carWashMode']['value']}")
             print(f"   Wiper Fluid: {state['wiperFluidState']['value']}")
+            if state.get('brakeFluidLow'):
+                print(f"   Brake Fluid Low: {state['brakeFluidLow']['value']}")
             print("   Tire pressures:")
             print(f"      Front Left: {state['tirePressureStatusFrontLeft']['value']}")
             print(f"      Front Right: {state['tirePressureStatusFrontRight']['value']}")
@@ -1101,6 +1303,10 @@ def main():
                     print(f"{datetime.now().strftime('%m/%d/%Y, %H:%M:%S %p %Z').strip()} Rivian API appears offline")
                 found_bad_response = True
                 last_state = None
+                if single_poll:
+                    # One-shot (--query, e.g. telegraf): don't retry forever on
+                    # an API outage; exit so the caller retries next interval.
+                    break
                 time.sleep(args.poll_frequency)
                 continue
             found_bad_response = False
@@ -1208,7 +1414,7 @@ def main():
 
     if args.charge_sessions or args.last_charge or args.all:
         sessions = charging_sessions(args.verbose)
-        if args.last_charge:
+        if args.last_charge and sessions:
             sessions = [sessions[-1]]
         for s in sessions:
             if s['energy'] == 0:
@@ -1230,41 +1436,46 @@ def main():
 
     if args.charge_session or args.all:
         session = charging_session(args.verbose)
-        print(f"Charger ID: {session['chargerId']}")
-        print(f"Transaction ID: {session['transactionId']}")
-        print(f"Rivian Charger: {session['isRivianCharger']}")
-        print(f"Charging Active: {session['vehicleChargerState']['value'] == 'charging_active'}")
-        print(f"Charging Updated: {show_local_time(session['vehicleChargerState']['updatedAt'])}")
+        if not session:
+            print("No active charging session")
+        else:
+            print(f"Charger ID: {session['chargerId']}")
+            print(f"Transaction ID: {session['transactionId']}")
+            print(f"Rivian Charger: {session['isRivianCharger']}")
+            print(f"Charging Active: {session['vehicleChargerState']['value'] == 'charging_active'}")
+            print(f"Charging Updated: {show_local_time(session['vehicleChargerState']['updatedAt'])}")
 
     if args.live_charging_session or args.all:
         state = get_vehicle_state(vehicle_id, args.verbose)
         s = live_charging_session(vehicle_id=vehicle_id,
                                   verbose=args.verbose)
+        if not state or not s:
+            print("No live charging session")
+        else:
+            print(f"Battery Level: {state['batteryLevel']['value']:.1f}%")
+            print(f"Range: {kilometers_to_distance_units(state['distanceToEmpty']['value'], args.metric):.1f} {distance_units}")
+            print(f"Battery Limit: {state['batteryLimit']['value']:.1f}%")
+            print(f"Charging state: {state['chargerState']['value']}")
+            print(f"Charger status: {state['chargerStatus']['value']}")
 
-        print(f"Battery Level: {state['batteryLevel']['value']:.1f}%")
-        print(f"Range: {kilometers_to_distance_units(state['distanceToEmpty']['value'], args.metric):.1f} {distance_units}")
-        print(f"Battery Limit: {state['batteryLimit']['value']:.1f}%")
-        print(f"Charging state: {state['chargerState']['value']}")
-        print(f"Charger status: {state['chargerStatus']['value']}")
-
-        print(f"Charging Active: {s['vehicleChargerState']['value'] == 'charging_active'}")
-        print(f"Charging Updated: {show_local_time(s['vehicleChargerState']['updatedAt'])}")
-        print(f"Charge Start: {show_local_time(s['startTime'])}")
-        if s['timeElapsed']:
-            elapsed_seconds = int(s['timeElapsed'])
-            elapsed = get_elapsed_time_string(elapsed_seconds)
-            print(f"Elapsed Time: {elapsed}")
-        if s['timeRemaining'] and s['timeRemaining']['value']:
-            remaining_seconds = int(s['timeRemaining']['value'])
-            remaining = get_elapsed_time_string(remaining_seconds)
-            print(f"Remaining Time: {remaining}")
-        print(f"Charge power: {s['power']['value']} kW")
-        print(f"Charge rate: {meters_to_distance_units(s['kilometersChargedPerHour']['value']*1000, args.metric):.1f} {distance_units_string}")
-        print(f"Range added: {meters_to_distance_units(s['rangeAddedThisSession']['value']*1000, args.metric):.1f} {distance_units}")
-        print(f"Total charged energy: {s['totalChargedEnergy']['value']} kW")
-        print(f"State of Charge: {s['soc']['value']:.1f}%")
-        print(f"currentMiles: {kilometers_to_distance_units(s['currentMiles']['value'], args.metric):.1f} {distance_units}")
-        print(f"current: {s['current']['value']}")
+            print(f"Charging Active: {s['vehicleChargerState']['value'] == 'charging_active'}")
+            print(f"Charging Updated: {show_local_time(s['vehicleChargerState']['updatedAt'])}")
+            print(f"Charge Start: {show_local_time(s['startTime'])}")
+            if s['timeElapsed']:
+                elapsed_seconds = int(s['timeElapsed'])
+                elapsed = get_elapsed_time_string(elapsed_seconds)
+                print(f"Elapsed Time: {elapsed}")
+            if s['timeRemaining'] and s['timeRemaining']['value']:
+                remaining_seconds = int(s['timeRemaining']['value'])
+                remaining = get_elapsed_time_string(remaining_seconds)
+                print(f"Remaining Time: {remaining}")
+            print(f"Charge power: {s['power']['value']} kW")
+            print(f"Charge rate: {meters_to_distance_units(s['kilometersChargedPerHour']['value']*1000, args.metric):.1f} {distance_units_string}")
+            print(f"Range added: {meters_to_distance_units(s['rangeAddedThisSession']['value']*1000, args.metric):.1f} {distance_units}")
+            print(f"Total charged energy: {s['totalChargedEnergy']['value']} kW")
+            print(f"State of Charge: {s['soc']['value']:.1f}%")
+            print(f"currentMiles: {kilometers_to_distance_units(s['currentMiles']['value'], args.metric):.1f} {distance_units}")
+            print(f"current: {s['current']['value']}")
 
     if args.live_charging_history or args.all:
         s = live_charging_history(vehicle_id=vehicle_id,
